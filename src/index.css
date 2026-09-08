@@ -427,3 +427,23 @@ html.dark ::-webkit-scrollbar-thumb:hover {
 .radar-ping {
   animation: radar-pulse 2s infinite cubic-bezier(0.4, 0, 0.6, 1);
 }
+
+/* =========================================================================
+   HOME SCREEN ACCORDION CARD ANIMATIONS
+   ========================================================================= */
+.case-card-collapse-grid {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows 300ms cubic-bezier(0.16, 1, 0.3, 1), opacity 240ms ease;
+  will-change: grid-template-rows, opacity;
+}
+
+.case-card-collapse-grid.is-expanded {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.case-card-collapse-inner {
+  overflow: hidden;
+}
