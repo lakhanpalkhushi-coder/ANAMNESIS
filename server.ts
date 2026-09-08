@@ -35,11 +35,103 @@ const requestedTimeout = Number(process.env.GEMINI_TIMEOUT_MS) || 60_000;
 const GEMINI_TIMEOUT_MS = Math.max(requestedTimeout, GEMINI_MIN_TIMEOUT_MS);
 
 /* ===========================================================================
+ * DETECTOR A — PRETRAINED SYNTHETIC-IMAGE CLASSIFIER
+ *
+ * The detection verdict must not be a number a language model wrote down.
+ * This route proxies the ingested frame to a pretrained image classifier on
+ * the Hugging Face Inference API and returns its label scores.
+ *
+ * It is a proxy rather than a direct browser call for one reason: the token
+ * would otherwise be in the bundle. Unlike API_SHARED_SECRET — which is a
+ * gate, not a credential — HF_TOKEN is a real credential against a metered
+ * account, so it stays server-side.
+ *
+ * The model id is configuration, not a literal, because which detector to
+ * trust is an empirical question this build has not yet answered. Swapping
+ * HF_DETECTOR_MODEL and re-running the benchmark set is the whole
+ * calibration workflow, and it must not require a rebuild.
+ * ======================================================================== */
+
+const HF_TOKEN = process.env.HF_TOKEN?.trim() || '';
+
+/* A general AI-generated-image classifier. It answers "was this image
+ * generated?", which is not the same question as "was this face swapped?" —
+ * a face-crop deepfake detector is a second detector, not a replacement for
+ * this one, and is not wired up yet. Say so rather than implying coverage
+ * this build does not have. */
+const HF_DETECTOR_MODEL = process.env.HF_DETECTOR_MODEL?.trim() || 'Organika/sdxl-detector';
+
+/* Hugging Face has been migrating inference to router.huggingface.co. The
+ * base is configurable so a routing change is a redeploy variable rather
+ * than a code change. */
+const HF_INFERENCE_BASE =
+  process.env.HF_INFERENCE_URL?.trim() || 'https://api-inference.huggingface.co/models';
+
+/* Shorter than the Gemini budget: this is one forward pass over a small
+ * image, and the only slow case is a cold model, which is retried rather
+ * than waited out. */
+const HF_TIMEOUT_MS = Math.max(Number(process.env.HF_TIMEOUT_MS) || 25_000, 5_000);
+
+/* ---------------------------------------------------------------------------
+ * Label vocabularies differ between detectors: artificial/human,
+ * Fake/Real, ai/hum. Rather than hardcoding one model's labels, both sides
+ * of the question are matched and the score is normalised over whichever
+ * labels were recognised.
+ *
+ * A model whose labels match neither list yields NOT_ASSESSED with a note.
+ * Guessing which of two unknown labels means "fake" is precisely the kind of
+ * invented finding this codebase refuses to produce.
+ * ------------------------------------------------------------------------ */
+const SYNTHETIC_LABELS =
+  /^(artificial|fake|ai|ai[-_ ]?generated|generated|synthetic|deepfake|spoof|manipulated|tampered)$/i;
+const AUTHENTIC_LABELS = /^(human|real|authentic|natural|genuine|pristine|nature)$/i;
+
+interface HuggingFaceLabel {
+  label: string;
+  score: number;
+}
+
+/**
+ * Reduce a classifier's label scores to a single 0-100 synthetic probability.
+ *
+ * Returns null when the vocabulary is unrecognised, so the caller reports a
+ * gap instead of a number nobody can interpret.
+ */
+function scoreFromLabels(labels: HuggingFaceLabel[]): number | null {
+  let synthetic = 0;
+  let authentic = 0;
+  let matched = false;
+
+  for (const entry of labels) {
+    const label = String(entry.label ?? '').trim();
+    const score = Number(entry.score);
+    if (!Number.isFinite(score)) continue;
+    if (SYNTHETIC_LABELS.test(label)) {
+      synthetic += score;
+      matched = true;
+    } else if (AUTHENTIC_LABELS.test(label)) {
+      authentic += score;
+      matched = true;
+    }
+  }
+
+  if (!matched) return null;
+
+  /* Normalise over the recognised labels only. A multi-class model may also
+   * emit classes belonging to neither side, and letting those dilute the
+   * denominator would understate a confident call. */
+  const total = synthetic + authentic;
+  if (total <= 0) return null;
+  return Math.round((synthetic / total) * 100);
+}
+
+/* ===========================================================================
  * G14 — SHARED-SECRET GATE
  *
- * Both POST routes are the only paths to a metered external API, and the
- * deployed URL is public. Without this, anyone who finds the host can spend
- * the key's quota; exhaustion before judging is a realistic outcome.
+ * All three POST routes are paths to a metered external API — two to Gemini
+ * and one to the Hugging Face detector — and the deployed URL is public.
+ * Without this, anyone who finds the host can spend the quota on either
+ * account; exhaustion before judging is a realistic outcome.
  *
  * Be clear about what this is. The browser has to send the secret, so the
  * secret is in the bundle, and anyone willing to open devtools can read it.
@@ -326,6 +418,25 @@ async function startServer() {
       engine: 'ANAMNESIS v3.4 Forensics Engine',
       model: GEMINI_MODEL,
       timeoutMs: GEMINI_TIMEOUT_MS,
+      /* Which component answers which question, so "what actually produced
+       * this verdict?" is answerable with one curl. */
+      detectors: [
+        {
+          id: HF_DETECTOR_MODEL,
+          role: 'synthetic',
+          backend: 'huggingface-inference-api',
+          configured: Boolean(HF_TOKEN),
+          timeoutMs: HF_TIMEOUT_MS,
+        },
+        {
+          id: 'signal-forensics',
+          role: 'signal',
+          backend: 'browser-canvas',
+          configured: true,
+          note: 'ELA block statistics, noise residual, JPEG ghost and seam prominence, computed client-side.',
+        },
+      ],
+      llm: { model: GEMINI_MODEL, role: 'context-and-explanation' },
       // Whether a secret is required, never the secret itself.
       authRequired: Boolean(API_SHARED_SECRET),
       rateLimit: { max: RATE_LIMIT_MAX, windowMs: RATE_LIMIT_WINDOW_MS },
@@ -575,6 +686,133 @@ Return valid JSON adhering exactly to the requested ANAMNESIS schema.
     }
   });
 
+  /* =======================================================================
+   * DETECTOR A — POST /api/forensics/detect
+   *
+   * One forward pass through a pretrained classifier. No language model is
+   * involved, and this route deliberately does not depend on the Gemini one:
+   * detection has to survive an LLM outage, which is the whole reason the
+   * two were separated.
+   *
+   * Failure never produces a score. Every error path returns a status and a
+   * message; the browser maps that to NOT_ASSESSED.
+   * ==================================================================== */
+  app.post('/api/forensics/detect', rateLimit, requireSharedSecret, async (req, res) => {
+    if (!HF_TOKEN) {
+      return res.status(503).json({
+        error:
+          'No synthetic-image detector is configured. Set HF_TOKEN (and optionally HF_DETECTOR_MODEL) to enable Detector A.',
+      });
+    }
+
+    const { imageBase64, mimeType = 'image/jpeg' } = req.body ?? {};
+    if (typeof imageBase64 !== 'string' || !imageBase64) {
+      return res.status(400).json({ error: 'No image was supplied to the detector.' });
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HF_TIMEOUT_MS);
+
+    try {
+      const cleanBase64 = imageBase64.replace(/^data:[a-zA-Z0-9/+.-]+;base64,/, '');
+      const bytes = Buffer.from(cleanBase64, 'base64');
+      if (bytes.byteLength === 0) {
+        return res.status(400).json({ error: 'The supplied image could not be decoded.' });
+      }
+
+      const upstream = await fetch(`${HF_INFERENCE_BASE}/${HF_DETECTOR_MODEL}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${HF_TOKEN}`,
+          'Content-Type': mimeType,
+          /* Without this a cold model returns 503 immediately. Waiting is
+           * still bounded by HF_TIMEOUT_MS above, and the timeout path is
+           * retryable, so a cold start costs a retry rather than a result. */
+          'x-wait-for-model': 'true',
+        },
+        body: bytes,
+        signal: controller.signal,
+      });
+
+      // Status before body, for the same reason src/lib/api.ts does it: an
+      // error payload must never be read as a finding.
+      if (!upstream.ok) {
+        const detail = await upstream.text().catch(() => '');
+        console.error(
+          `Hugging Face detector ${HF_DETECTOR_MODEL} returned ${upstream.status}: ${detail.slice(0, 400)}`
+        );
+
+        if (upstream.status === 401 || upstream.status === 403) {
+          return res
+            .status(502)
+            .json({ error: 'The detector rejected the credentials. Check HF_TOKEN.' });
+        }
+        if (upstream.status === 404) {
+          return res.status(502).json({
+            error: `The detector model "${HF_DETECTOR_MODEL}" was not found. Check HF_DETECTOR_MODEL.`,
+          });
+        }
+        if (upstream.status === 429) {
+          return res
+            .status(429)
+            .json({ error: 'The detector is rate limited. Wait a few seconds and retry.' });
+        }
+        if (upstream.status === 503) {
+          return res
+            .status(503)
+            .json({ error: 'The detector model is still loading. Retry in a few seconds.' });
+        }
+        return res
+          .status(502)
+          .json({ error: `The detector could not classify this image (HTTP ${upstream.status}).` });
+      }
+
+      const payload = await upstream.json().catch(() => null);
+
+      /* Image-classification pipelines return an array of {label, score}.
+       * Some return it nested one level deeper when given a batch. */
+      const raw: unknown = Array.isArray(payload) && Array.isArray(payload[0]) ? payload[0] : payload;
+      if (!Array.isArray(raw)) {
+        console.error('Unexpected detector payload shape:', JSON.stringify(payload)?.slice(0, 400));
+        return res
+          .status(502)
+          .json({ error: 'The detector returned a response that could not be read.' });
+      }
+
+      const labelScores: HuggingFaceLabel[] = raw
+        .filter((e): e is HuggingFaceLabel => Boolean(e) && typeof e === 'object')
+        .map((e) => ({ label: String((e as any).label ?? ''), score: Number((e as any).score) }))
+        .filter((e) => Number.isFinite(e.score));
+
+      const score = scoreFromLabels(labelScores);
+
+      res.json({
+        modelId: HF_DETECTOR_MODEL,
+        backend: 'huggingface-inference-api',
+        // null, not 0. The browser turns this into NOT_ASSESSED.
+        syntheticProbabilityScore: score,
+        labelScores,
+        note:
+          score === null
+            ? `The detector returned labels this build does not recognise (${labelScores
+                .map((l) => l.label)
+                .join(', ') || 'none'}), so no synthetic probability can be derived.`
+            : undefined,
+      });
+    } catch (error: any) {
+      console.error('Error in synthetic detector:', error);
+      if (res.headersSent || res.writableEnded) return;
+      if (controller.signal.aborted) {
+        return res.status(504).json({
+          error: `The detector did not respond within ${Math.round(HF_TIMEOUT_MS / 1000)} seconds. Retrying often succeeds once the model is warm.`,
+        });
+      }
+      res.status(502).json({ error: 'The detector could not be reached.' });
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
   // Forensic Cross-Examination Chat endpoint
   app.post('/api/forensics/chat', rateLimit, requireSharedSecret, async (req, res) => {
     const abort = requestAbort(res);
@@ -665,6 +903,13 @@ Write for an investigator reading a chat panel, not a paper. Use short paragraph
       );
     }
     console.log(`ANAMNESIS API key: ${process.env.GEMINI_API_KEY ? 'configured' : 'MISSING - analysis will fail'}`);
+    console.log(
+      `ANAMNESIS detector: ${
+        HF_TOKEN
+          ? `${HF_DETECTOR_MODEL} via Hugging Face (${HF_TIMEOUT_MS}ms)`
+          : 'HF_TOKEN MISSING - synthetic probability will report NOT_ASSESSED'
+      }`
+    );
     console.log(
       `ANAMNESIS auth:    ${
         API_SHARED_SECRET

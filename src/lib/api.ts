@@ -18,6 +18,8 @@
 import {
   AnamnesisForensicReport,
   MediaIntakeData,
+  NOT_ASSESSED,
+  SyntheticDetectorResult,
 } from '../types';
 
 /**
@@ -192,7 +194,7 @@ export async function postJson<TResponse>(
 }
 
 /* ---------------------------------------------------------------------------
- * Typed route wrappers. The three routes in the API surface, and no others.
+ * Typed route wrappers. The four routes in the API surface, and no others.
  * ------------------------------------------------------------------------ */
 
 export interface HealthResponse {
@@ -244,6 +246,43 @@ export function analyzeMedia(
   options?: { signal?: AbortSignal }
 ): Promise<AnamnesisForensicReport> {
   return postJson<AnamnesisForensicReport>('/api/forensics/analyze', request, options);
+}
+
+/* ---------------------------------------------------------------------------
+ * Detector A.
+ *
+ * The wire shape carries `null` for an absent score because JSON has no
+ * NOT_ASSESSED. It is converted at this boundary and nowhere else, so no
+ * caller downstream ever has to remember which representation it is holding.
+ * ------------------------------------------------------------------------ */
+interface DetectWireResponse {
+  modelId: string;
+  backend: string;
+  syntheticProbabilityScore: number | null;
+  labelScores: Array<{ label: string; score: number }>;
+  note?: string;
+}
+
+/**
+ * POST /api/forensics/detect — one forward pass through a pretrained
+ * classifier. Throws ApiError on failure; it never returns a substitute
+ * score, because a fabricated 0 and a measured 0 must not look alike.
+ */
+export async function detectSynthetic(
+  request: { imageBase64: string; mimeType: string },
+  options?: { signal?: AbortSignal }
+): Promise<SyntheticDetectorResult> {
+  const wire = await postJson<DetectWireResponse>('/api/forensics/detect', request, options);
+  return {
+    modelId: wire.modelId,
+    backend: wire.backend,
+    syntheticProbabilityScore:
+      typeof wire.syntheticProbabilityScore === 'number'
+        ? wire.syntheticProbabilityScore
+        : NOT_ASSESSED,
+    labelScores: Array.isArray(wire.labelScores) ? wire.labelScores : [],
+    note: wire.note,
+  };
 }
 
 /** POST /api/forensics/chat — one investigator question, one reply. */

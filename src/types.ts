@@ -280,6 +280,115 @@ export interface ManipulationAssessment {
   /** Honest capability label shown alongside every result. */
   assessmentLabel: string;
   generatedAt: string;
+  /** Which detector produced each number, so an exported dossier is
+   *  reproducible months later against the same model and thresholds. */
+  detectorProvenance?: DetectorProvenanceEntry[];
+}
+
+/* =========================================================================
+   DETECTION LAYER
+   Two detectors, deliberately independent, because the classifier above
+   splits AI-based from conventional manipulation and no single model
+   answers both questions.
+
+     Detector A — a pretrained image classifier reached through the Hugging
+                  Face Inference API. Produces syntheticProbabilityScore.
+     Detector B — signal forensics computed in the browser over the ingested
+                  pixels. Produces manipulationConfidence, the mutation list,
+                  the compression generation estimate and the metadata flag.
+
+   Neither may return zero on failure. A detector that did not run, could not
+   run, or ran and failed contributes NOT_ASSESSED, and the difference
+   between "measured as clean" and "not measured" survives to the dossier.
+   ========================================================================= */
+
+/** Raw measurements from Detector B. Uncalibrated indicators, not probabilities. */
+export interface ForensicStatistics {
+  /** False when the file could not be measured. Every field below is then
+   *  meaningless and must not be displayed as a finding. */
+  usable: boolean;
+  unusableReason?: string;
+  /** Resolution the statistics were computed at, not the file's own. */
+  workingWidth: number;
+  workingHeight: number;
+  /** Variance of per-block ELA means, normalised by the mean. */
+  elaBlockVariance: number;
+  /** Fraction of ELA blocks that are robust (median + 2 sigma) outliers. */
+  elaOutlierBlockRatio: number;
+  /** Mean absolute Laplacian residual, 0-255. The sensor grain floor. */
+  noiseResidualMean: number;
+  /** Spread of the per-block noise floor relative to its median. */
+  noiseUniformity: number;
+  /** JPEG qualities at which the ghost curve dips — the file's quantisation history. */
+  jpegGhostQualities: number[];
+  /** Prominence of the strongest straight row/column edge ridge, 0-1. */
+  seamProminence: number;
+}
+
+/** One weighted term in the manipulationConfidence sum, kept so the score
+ *  can be shown as its parts rather than as an unexplained number. */
+export interface SignalComponent {
+  id: 'splice' | 'noiseMismatch' | 'noiseFloor' | 'recompression';
+  label: string;
+  /** The underlying measurement, in words, for display and for the dossier. */
+  measurement: string;
+  /** 0-1 after the documented ramp. */
+  normalised: number;
+  /** Fusion weight. All weights sum to 1. */
+  weight: number;
+}
+
+/** Detector B's output, in the shape the case state consumes. */
+export interface SignalFindings {
+  mutations: string[];
+  /** Explicit category per mutation, parallel to `mutations`. Removes the
+   *  need to recover by regex what this codebase already knows. */
+  categories: ManipulationIndicatorCategory[];
+  manipulationConfidence: number; // 0-100
+  compressionGenerations: number;
+  metadataTamperFlag: boolean;
+  components: SignalComponent[];
+  statistics: ForensicStatistics;
+}
+
+/** Detector A's output. */
+export interface SyntheticDetectorResult {
+  /** Hugging Face repository id, e.g. "Organika/sdxl-detector". */
+  modelId: string;
+  backend: string;
+  /** NOT_ASSESSED when the model was unreachable, still loading, or returned
+   *  a label vocabulary this build does not recognise. */
+  syntheticProbabilityScore: Assessable<number>;
+  /** Every label the model returned, unmodified, so an unfamiliar vocabulary
+   *  is diagnosable rather than silently discarded. */
+  labelScores: Array<{ label: string; score: number }>;
+  /** Why the score is absent, when it is. */
+  note?: string;
+}
+
+export interface DetectorProvenanceEntry {
+  id: string;
+  role: 'synthetic' | 'signal';
+  backend: string;
+  score: Assessable<number>;
+  /** The value at which this detector's signal becomes a reported finding. */
+  threshold?: number;
+}
+
+/**
+ * What the builder is given about a live detection run.
+ *
+ * `attempted` is the load-bearing field. When true, this is a live run and
+ * the model's own numeric guesses are never consulted — a detector that
+ * failed yields NOT_ASSESSED rather than quietly falling back to the
+ * language model, which would reinstate exactly the problem the detectors
+ * were added to remove. When false (Demo Mode, an empty case), the fixture's
+ * technical_metrics are used and are labelled as an estimate.
+ */
+export interface DetectorEvidence {
+  attempted: boolean;
+  signal?: SignalFindings;
+  synthetic?: SyntheticDetectorResult;
 }
 
 export interface PersistentCaseState {
@@ -309,10 +418,20 @@ export interface PersistentCaseState {
     };
     manipulation: {
       mutationsDetected: string[];
+      /** Category per mutation, parallel to mutationsDetected, when the
+       *  producer knew it. Absent on cases built before the detector layer
+       *  and on model-supplied mutation text, which classifyMutation sorts. */
+      mutationCategories?: ManipulationIndicatorCategory[];
       syntheticProbabilityScore: Assessable<number>;
       manipulationConfidence: Assessable<number>;
       status: StandardEvidenceStatus;
     };
+    /** Detector B's raw measurements, when it ran. */
+    forensicStatistics?: ForensicStatistics;
+    /** The weighted terms behind manipulationConfidence, when it was measured. */
+    signalComponents?: SignalComponent[];
+    /** Which detector produced each number in this case. */
+    detectorProvenance?: DetectorProvenanceEntry[];
     sourceCompleteness?: SourceCompletenessData;
     manipulationAssessment?: ManipulationAssessment;
   };

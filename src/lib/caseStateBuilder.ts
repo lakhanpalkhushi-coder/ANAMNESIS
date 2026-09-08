@@ -1,10 +1,18 @@
 import {
   AnamnesisForensicReport,
+  Assessable,
+  DetectorEvidence,
+  DetectorProvenanceEntry,
+  ForensicStatistics,
+  isAssessed,
+  ManipulationIndicatorCategory,
   MediaIntakeData,
   NOT_ASSESSED,
   PersistentCaseState,
+  SignalComponent,
   STATUS_NOT_ASSESSED,
   StandardEvidenceStatus,
+  TechnicalForensicMetrics,
 } from '../types';
 import { deriveManipulationAssessment } from './manipulationAssessment';
 
@@ -29,16 +37,150 @@ import { deriveManipulationAssessment } from './manipulationAssessment';
  * something actually measures them.
  * ========================================================================= */
 
+/* =========================================================================
+ * DETECTION RESOLUTION
+ *
+ * Which component is allowed to state the manipulation numbers.
+ *
+ * The rule is one line long: when detectors were attempted, only detectors
+ * speak. A detector that failed leaves a gap. Falling back to the language
+ * model's own guess would quietly reinstate the arrangement the detector
+ * layer exists to replace — the number would look identical on screen while
+ * meaning something entirely different.
+ *
+ * When detectors were NOT attempted — Demo Mode fixtures, an empty case —
+ * the report's technical_metrics are used and are labelled in the provenance
+ * as an estimate rather than a measurement.
+ * ========================================================================= */
+
+interface ResolvedDetection {
+  mutationsDetected: string[];
+  mutationCategories?: ManipulationIndicatorCategory[];
+  syntheticProbabilityScore: Assessable<number>;
+  manipulationConfidence: Assessable<number>;
+  compressionGenerations: Assessable<number>;
+  metadataTamperFlag: Assessable<boolean>;
+  status: StandardEvidenceStatus;
+  provenance: DetectorProvenanceEntry[];
+  forensicStatistics?: ForensicStatistics;
+  signalComponents?: SignalComponent[];
+}
+
+/** The verdict badge. Unchanged thresholds; only the source of the numbers moved. */
+function deriveManipulationStatus(
+  manipulationScore: Assessable<number>,
+  syntheticScore: Assessable<number>
+): StandardEvidenceStatus {
+  if (!isAssessed(manipulationScore) && !isAssessed(syntheticScore)) {
+    return STATUS_NOT_ASSESSED;
+  }
+  if (
+    (isAssessed(manipulationScore) && manipulationScore > 70) ||
+    (isAssessed(syntheticScore) && syntheticScore > 70)
+  ) {
+    return '🔴 INCONSISTENT';
+  }
+  if (isAssessed(manipulationScore) && manipulationScore > 40) {
+    return '🟠 NEEDS VERIFICATION';
+  }
+  return '🟢 OBSERVED / CONSISTENT';
+}
+
+function resolveDetection(
+  evidence: DetectorEvidence,
+  tech: TechnicalForensicMetrics | undefined,
+  modelMutations: string[]
+): ResolvedDetection {
+  if (evidence.attempted) {
+    const signal = evidence.signal;
+    const synthetic = evidence.synthetic;
+
+    const syntheticScore = synthetic?.syntheticProbabilityScore ?? NOT_ASSESSED;
+    const manipulationScore = signal ? signal.manipulationConfidence : NOT_ASSESSED;
+
+    const provenance: DetectorProvenanceEntry[] = [];
+    if (synthetic) {
+      provenance.push({
+        id: synthetic.modelId,
+        role: 'synthetic',
+        backend: synthetic.backend,
+        score: syntheticScore,
+        // The classifier's reporting threshold in manipulationAssessment.ts.
+        threshold: 55,
+      });
+    }
+    if (signal) {
+      provenance.push({
+        id: 'signal-forensics',
+        role: 'signal',
+        backend: 'browser-canvas',
+        score: manipulationScore,
+      });
+    }
+
+    return {
+      /* Only measured transformations drive the classification. The model's
+       * own observations are not discarded — they remain on the Q4 panel and
+       * in the dossier under the five questions — but they no longer decide
+       * a manipulation type, which is the entire point of this layer. */
+      mutationsDetected: signal?.mutations ?? [],
+      mutationCategories: signal?.categories,
+      syntheticProbabilityScore: syntheticScore,
+      manipulationConfidence: manipulationScore,
+      compressionGenerations: signal ? signal.compressionGenerations : NOT_ASSESSED,
+      metadataTamperFlag: signal ? signal.metadataTamperFlag : NOT_ASSESSED,
+      status: deriveManipulationStatus(manipulationScore, syntheticScore),
+      provenance,
+      forensicStatistics: signal?.statistics,
+      signalComponents: signal?.components,
+    };
+  }
+
+  /* No detector ran. Precomputed reference cases live here. */
+  const syntheticScore = tech?.synthetic_probability_score ?? NOT_ASSESSED;
+  const manipulationScore = tech?.manipulation_confidence ?? NOT_ASSESSED;
+  const provenance: DetectorProvenanceEntry[] =
+    isAssessed(syntheticScore) || isAssessed(manipulationScore)
+      ? [
+          {
+            id: 'model-estimate',
+            role: 'signal',
+            backend: 'language-model',
+            score: manipulationScore,
+          },
+        ]
+      : [];
+
+  return {
+    mutationsDetected: modelMutations,
+    syntheticProbabilityScore: syntheticScore,
+    manipulationConfidence: manipulationScore,
+    compressionGenerations: tech?.compression_generations ?? NOT_ASSESSED,
+    metadataTamperFlag: tech?.metadata_tamper_flag ?? NOT_ASSESSED,
+    status: deriveManipulationStatus(manipulationScore, syntheticScore),
+    provenance,
+  };
+}
+
 /**
  * A case that carries real intake measurements and nothing else.
  *
- * Reached when analysis has not run, or when it ran and failed. The hash,
- * the EXIF tags and the claimed context are genuine and are shown; every
- * interpretive field renders as the gap. This is a legitimate, displayable
- * state — a failed analyse call must land here, not on a green tick.
+ * Reached when the interpretive analysis has not run, or ran and failed. The
+ * hash, the EXIF tags and the claimed context are genuine and are shown;
+ * every field the language model would have supplied renders as the gap.
+ *
+ * Detector evidence, when present, survives into this state. That is the
+ * point of separating the two: a Gemini outage now costs the context and the
+ * narrative, not the detection, and a case built here can still carry a real
+ * measured manipulation confidence.
  */
-function buildUnanalysedCaseState(intake: MediaIntakeData): PersistentCaseState {
-  return {
+function buildUnanalysedCaseState(
+  intake: MediaIntakeData,
+  evidence: DetectorEvidence
+): PersistentCaseState {
+  const detection = resolveDetection(evidence, undefined, []);
+
+  const state: PersistentCaseState = {
     ingest: intake,
     analysis: {
       visual: {
@@ -59,16 +201,20 @@ function buildUnanalysedCaseState(intake: MediaIntakeData): PersistentCaseState 
       },
       structural: {
         streamCharacteristics: NOT_ASSESSED,
-        compressionGenerations: NOT_ASSESSED,
-        metadataTamperFlag: NOT_ASSESSED,
+        compressionGenerations: detection.compressionGenerations,
+        metadataTamperFlag: detection.metadataTamperFlag,
         confidence: NOT_ASSESSED,
       },
       manipulation: {
-        mutationsDetected: [],
-        syntheticProbabilityScore: NOT_ASSESSED,
-        manipulationConfidence: NOT_ASSESSED,
-        status: STATUS_NOT_ASSESSED,
+        mutationsDetected: detection.mutationsDetected,
+        mutationCategories: detection.mutationCategories,
+        syntheticProbabilityScore: detection.syntheticProbabilityScore,
+        manipulationConfidence: detection.manipulationConfidence,
+        status: detection.status,
       },
+      forensicStatistics: detection.forensicStatistics,
+      signalComponents: detection.signalComponents,
+      detectorProvenance: detection.provenance.length ? detection.provenance : undefined,
     },
     relationships: {
       totalRelatedFound: NOT_ASSESSED,
@@ -128,14 +274,24 @@ function buildUnanalysedCaseState(intake: MediaIntakeData): PersistentCaseState 
       },
     },
   };
+
+  /* Derived here too. A detector-only case has a real manipulation
+   * confidence and must reach the classifier, or a live measurement would
+   * render as INCONCLUSIVE purely because the narrative call failed. */
+  state.analysis.manipulationAssessment = deriveManipulationAssessment(state);
+
+  return state;
 }
 
 export function buildCaseState(
   intake: MediaIntakeData,
-  report: AnamnesisForensicReport | null
+  report: AnamnesisForensicReport | null,
+  /* Defaults to "no detectors were attempted", which keeps every existing
+   * call site — empty cases and Demo Mode fixtures — behaving as before. */
+  evidence: DetectorEvidence = { attempted: false }
 ): PersistentCaseState {
   if (!report) {
-    return buildUnanalysedCaseState(intake);
+    return buildUnanalysedCaseState(intake, evidence);
   }
 
   const q = report.the_five_questions;
@@ -156,18 +312,7 @@ export function buildCaseState(
     return '🔵 ESTIMATED';
   };
 
-  const syntheticScore = tech?.synthetic_probability_score ?? NOT_ASSESSED;
-  const manipulationScore = tech?.manipulation_confidence ?? NOT_ASSESSED;
-
-  const manipulationStatus: StandardEvidenceStatus =
-    manipulationScore === NOT_ASSESSED && syntheticScore === NOT_ASSESSED
-      ? STATUS_NOT_ASSESSED
-      : (manipulationScore !== NOT_ASSESSED && manipulationScore > 70) ||
-        (syntheticScore !== NOT_ASSESSED && syntheticScore > 70)
-      ? '🔴 INCONSISTENT'
-      : manipulationScore !== NOT_ASSESSED && manipulationScore > 40
-      ? '🟠 NEEDS VERIFICATION'
-      : '🟢 OBSERVED / CONSISTENT';
+  const detection = resolveDetection(evidence, tech, q.what_changed.mutations_detected);
 
   const state: PersistentCaseState = {
     ingest: intake,
@@ -206,16 +351,22 @@ export function buildCaseState(
       structural: {
         // Nothing measures the container format or colour primaries.
         streamCharacteristics: NOT_ASSESSED,
-        compressionGenerations: tech?.compression_generations ?? NOT_ASSESSED,
-        metadataTamperFlag: tech?.metadata_tamper_flag ?? NOT_ASSESSED,
+        /* Measured from the JPEG ghost curve when Detector B ran; the
+         * model's estimate only for a case with no detector. */
+        compressionGenerations: detection.compressionGenerations,
+        metadataTamperFlag: detection.metadataTamperFlag,
         confidence: NOT_ASSESSED,
       },
       manipulation: {
-        mutationsDetected: q.what_changed.mutations_detected,
-        syntheticProbabilityScore: syntheticScore,
-        manipulationConfidence: manipulationScore,
-        status: manipulationStatus,
+        mutationsDetected: detection.mutationsDetected,
+        mutationCategories: detection.mutationCategories,
+        syntheticProbabilityScore: detection.syntheticProbabilityScore,
+        manipulationConfidence: detection.manipulationConfidence,
+        status: detection.status,
       },
+      forensicStatistics: detection.forensicStatistics,
+      signalComponents: detection.signalComponents,
+      detectorProvenance: detection.provenance.length ? detection.provenance : undefined,
       /* sourceCompleteness is omitted. Establishing whether a clip is an
        * extract requires the full source, which the system never has. The
        * field is optional precisely so this can be absent rather than

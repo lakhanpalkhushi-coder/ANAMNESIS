@@ -24,7 +24,7 @@ import {
 } from 'lucide-react';
 import { isAssessed, NOT_ASSESSED, PersistentCaseState } from '../types';
 import { ManipulationAssessmentCard } from './ManipulationAssessmentCard';
-import { getManipulationAssessment } from '../lib/manipulationAssessment';
+import { formatAssessedPct, getManipulationAssessment } from '../lib/manipulationAssessment';
 
 interface FinalConnectedInvestigationProps {
   caseState: PersistentCaseState;
@@ -235,7 +235,10 @@ export const FinalConnectedInvestigation: React.FC<FinalConnectedInvestigationPr
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-900 text-cyan-400 border border-zinc-800">
-                {analysis.manipulation.manipulationConfidence}% TAMPER SCORE
+                {/* formatAssessedPct, not string interpolation: a case whose
+                    signal forensics could not run carries the gap here, and
+                    the raw value would render as "NOT_ASSESSED% TAMPER SCORE". */}
+                {formatAssessedPct(analysis.manipulation.manipulationConfidence)} TAMPER SCORE
               </span>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-900 text-amber-400 border border-zinc-800 hidden sm:inline">
                 {getManipulationAssessment(caseState).likelyTypeLabel}

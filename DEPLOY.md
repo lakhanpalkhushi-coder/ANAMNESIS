@@ -85,6 +85,30 @@ if you skip it:
 gcloud secrets add-iam-policy-binding gemini-api-key --member="serviceAccount:$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com" --role="roles/secretmanager.secretAccessor"
 ```
 
+## 6b. Store the Hugging Face token
+
+The manipulation verdict comes from detectors, not from the language model.
+Detector B — signal forensics: ELA block statistics, sensor-noise residual and
+the JPEG ghost curve — runs in the browser and needs no configuration. Detector
+A is a pretrained synthetic-image classifier reached through the Hugging Face
+Inference API, and it needs a token.
+
+Unlike `API_SHARED_SECRET`, this is a real credential against a metered
+account and is never compiled into the bundle, so it belongs in Secret Manager
+alongside the Gemini key:
+
+```bash
+printf '%s' 'PASTE_YOUR_HF_TOKEN_HERE' | gcloud secrets create hf-token --data-file=-
+```
+
+```bash
+gcloud secrets add-iam-policy-binding hf-token --member="serviceAccount:$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com" --role="roles/secretmanager.secretAccessor"
+```
+
+Deploying without it is supported and fails honestly: synthetic probability
+reports `NOT_ASSESSED`, the manipulation confidence is still measured by
+Detector B, and the startup log says which detector is missing.
+
 ## 7. Build the image
 
 Replace `YOUR-SHARED-SECRET` with the string you chose. It is compiled into the
@@ -101,7 +125,7 @@ The same secret string as step 7. If they differ, the server will demand a
 header the browser never sends and every analysis returns 401.
 
 ```bash
-gcloud run deploy anamnesis-media-forensics-engine --region asia-southeast1 --image "asia-southeast1-docker.pkg.dev/$PROJECT_ID/anamnesis/anamnesis-media-forensics-engine:latest" --allow-unauthenticated --max-instances 1 --timeout 120 --set-env-vars "NODE_ENV=production,GEMINI_MODEL=gemini-3.6-flash,API_SHARED_SECRET=YOUR-SHARED-SECRET" --set-secrets GEMINI_API_KEY=gemini-api-key:latest
+gcloud run deploy anamnesis-media-forensics-engine --region asia-southeast1 --image "asia-southeast1-docker.pkg.dev/$PROJECT_ID/anamnesis/anamnesis-media-forensics-engine:latest" --allow-unauthenticated --max-instances 1 --timeout 120 --set-env-vars "NODE_ENV=production,GEMINI_MODEL=gemini-3.6-flash,HF_DETECTOR_MODEL=Organika/sdxl-detector,API_SHARED_SECRET=YOUR-SHARED-SECRET" --set-secrets GEMINI_API_KEY=gemini-api-key:latest,HF_TOKEN=hf-token:latest
 ```
 
 ## 9. Verify

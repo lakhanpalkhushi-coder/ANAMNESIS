@@ -36,6 +36,7 @@ import {
 } from './data/mockInvestigator';
 import {
   AnamnesisForensicReport,
+  DetectorEvidence,
   ExportableDossier,
   InvestigatorProfile,
   isAssessed,
@@ -47,8 +48,9 @@ import {
 } from './types';
 import { soundFx } from './lib/soundFx';
 import { ThemeProvider } from './lib/themeContext';
-import { analyzeMedia, ApiError, toAnalyzeRequest } from './lib/api';
+import { analyzeMedia, ApiError, detectSynthetic, toAnalyzeRequest } from './lib/api';
 import { prepareImageForModel } from './lib/imagePrep';
+import { computeForensicStatistics, deriveSignalFindings } from './lib/forensicStatistics';
 
 /** The zero state of an intake: no file, no claims, no measurements. */
 const EMPTY_INTAKE: MediaIntakeData = {
@@ -121,6 +123,11 @@ function AppContent() {
   // cancellable spinner rather than an instant transition to fabricated data.
   const [isAnalysing, setIsAnalysing] = useState(false);
   const analyseAbortRef = useRef<AbortController | null>(null);
+  /* Distinguishes "the investigator pressed Cancel" from "the context call
+   * failed on its own". Both surface as an aborted fetch, but only the
+   * second may proceed on detector evidence alone — advancing a workflow
+   * somebody just cancelled would be its own kind of dishonesty. */
+  const analyseCancelledRef = useRef(false);
 
   /* The last submitted intake, kept so the error card's Retry button can
    * re-fire the exact same request. A retry that made the investigator
@@ -419,7 +426,13 @@ function AppContent() {
 
     const controller = new AbortController();
     analyseAbortRef.current = controller;
+    analyseCancelledRef.current = false;
     setIsAnalysing(true);
+
+    /* Declared out here so the failure path below can keep whatever the
+     * detectors managed to measure. A case that loses its context call
+     * should not also lose its measurements. */
+    let evidence: DetectorEvidence = { attempted: true };
 
     try {
       /* A full-resolution phone photograph does not fit the request
@@ -428,16 +441,111 @@ function AppContent() {
         * the hash, the EXIF and the forensic canvas all use the original
         * bytes. */
       const prepared = await prepareImageForModel(imageBase64, mimeType);
-      const report = await analyzeMedia(
-        toAnalyzeRequest(intake, prepared.dataUrl, prepared.mimeType),
-        { signal: controller.signal }
-      );
 
-      const analysedState = buildCaseState(intake, report);
+      /* THREE INDEPENDENT MEASUREMENTS, RUN TOGETHER.
+       *
+       *   Detector B  signal forensics, in this browser, over the ORIGINAL
+       *               bytes. Its statistics are the whole point and must not
+       *               describe a resized copy.
+       *   Detector A  a pretrained classifier via the server proxy, on the
+       *               bounded copy, which is all it needs.
+       *   Gemini      the context questions and the narrative. It no longer
+       *               supplies a number that reaches the classifier.
+       *
+       * allSettled, not all: these three fail for entirely unrelated
+       * reasons, and one failing must not discard the other two. */
+      const [signalOutcome, syntheticOutcome, reportOutcome] = await Promise.allSettled([
+        computeForensicStatistics(imageBase64),
+        detectSynthetic(
+          { imageBase64: prepared.dataUrl, mimeType: prepared.mimeType },
+          { signal: controller.signal }
+        ),
+        analyzeMedia(toAnalyzeRequest(intake, prepared.dataUrl, prepared.mimeType), {
+          signal: controller.signal,
+        }),
+      ]);
+
+      const statistics = signalOutcome.status === 'fulfilled' ? signalOutcome.value : null;
+      evidence = {
+        attempted: true,
+        signal: statistics
+          ? deriveSignalFindings(statistics, {
+              exifData: intake.exifData,
+              mimeType,
+            }) ?? undefined
+          : undefined,
+        synthetic: syntheticOutcome.status === 'fulfilled' ? syntheticOutcome.value : undefined,
+      };
+
+      /* A detector that could not run is stated, not hidden. The case is
+       * still usable — it simply carries NOT_ASSESSED where that detector's
+       * number would have been. */
+      const detectorGaps: string[] = [];
+      if (!evidence.signal) {
+        detectorGaps.push(
+          `Signal forensics could not measure this file${
+            statistics?.unusableReason ? ` (${statistics.unusableReason})` : ''
+          }.`
+        );
+      }
+      if (!evidence.synthetic) {
+        const reason =
+          syntheticOutcome.status === 'rejected' && syntheticOutcome.reason instanceof ApiError
+            ? ` (${syntheticOutcome.reason.message})`
+            : '';
+        detectorGaps.push(`The synthetic-image detector did not return a score${reason}.`);
+      } else if (!isAssessed(evidence.synthetic.syntheticProbabilityScore)) {
+        detectorGaps.push(
+          evidence.synthetic.note ?? 'The synthetic-image detector returned no usable score.'
+        );
+      }
+
+      if (reportOutcome.status === 'rejected') {
+        /* The context call failed. If the investigator cancelled, or the
+         * detectors have nothing either, this is an ordinary failure and
+         * goes to the catch below. */
+        if (analyseCancelledRef.current || !evidence.signal) {
+          throw reportOutcome.reason;
+        }
+
+        /* Otherwise: detection succeeded and only the interpretation is
+         * missing. This is the case the split was built for — the numbers on
+         * screen are measured, and the panels the model would have filled
+         * show the gap. The workflow may advance, because a real analysis
+         * did run; the message says exactly which half is absent. */
+        const partialState = buildCaseState(intake, null, evidence);
+        const donePartial = Array.from(new Set([...completedSteps, 1]));
+        const contextError =
+          reportOutcome.reason instanceof ApiError
+            ? reportOutcome.reason.message
+            : 'The context analysis could not be completed.';
+
+        setCaseState(partialState);
+        setCompletedSteps(donePartial);
+        setWorkflowStage(1.5);
+        setCanRetryAnalysis(true);
+        setErrorMessage(
+          [
+            `Context analysis unavailable: ${contextError}`,
+            'Detection completed. The manipulation confidence, compression history and metadata flag on this case were measured in this browser. The location, date and narrative checks are NOT ASSESSED — retry to fill them in.',
+            ...detectorGaps,
+          ].join(' ')
+        );
+        soundFx.playStepCompletion();
+        triggerStepFeedback('STEP 1: Detection complete; context unavailable.');
+        syncActiveCase(partialState, 1.5, donePartial, activeCaseId);
+        return;
+      }
+
+      const analysedState = buildCaseState(intake, reportOutcome.value, evidence);
       const done = Array.from(new Set([...completedSteps, 1]));
       setCaseState(analysedState);
       setCompletedSteps(done);
       setWorkflowStage(1.5);
+      if (detectorGaps.length) {
+        setErrorMessage(detectorGaps.join(' '));
+        setCanRetryAnalysis(true);
+      }
       soundFx.playStepCompletion();
       triggerStepFeedback('STEP 1: Media ingested and analysed.');
       syncActiveCase(analysedState, 1.5, done, activeCaseId);
@@ -459,16 +567,18 @@ function AppContent() {
       );
       setCanRetryAnalysis(Boolean(apiError?.isRetryable));
 
-      const localOnlyState = buildCaseState(intake, null);
+      const localOnlyState = buildCaseState(intake, null, evidence);
       setCaseState(localOnlyState);
       syncActiveCase(localOnlyState, workflowStage, completedSteps, activeCaseId);
     } finally {
       setIsAnalysing(false);
       analyseAbortRef.current = null;
+      analyseCancelledRef.current = false;
     }
   };
 
   const handleCancelAnalysis = () => {
+    analyseCancelledRef.current = true;
     analyseAbortRef.current?.abort();
   };
 

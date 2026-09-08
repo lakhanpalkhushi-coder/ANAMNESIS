@@ -181,6 +181,23 @@ export function deriveManipulationAssessment(
 
   const mutations = manipulation?.mutationsDetected ?? [];
 
+  /* Where a mutation's category is known at the point of measurement, use it.
+   * classifyMutation stays the fallback for stored cases, for Demo Mode
+   * fixtures and for model-supplied prose — but a detector that already
+   * knows it measured a splice should not have that fact recovered from its
+   * own wording by regular expression.
+   *
+   * Indexed rather than zipped: the arrays are parallel by construction, and
+   * a short or absent category array degrades to the regex per element
+   * instead of failing. */
+  const declaredCategories = manipulation?.mutationCategories;
+  const categories: ManipulationIndicatorCategory[] = mutations.map(
+    (m, i) => declaredCategories?.[i] ?? classifyMutation(m)
+  );
+  const mutationOrigin = declaredCategories?.length
+    ? 'Signal forensics (measured)'
+    : 'Transformation analysis';
+
   /* The two numbers the whole classification rests on. Both are gaps until
    * an analysis produces them, and a gap is not a zero. */
   const rawSynthetic = manipulation?.syntheticProbabilityScore;
@@ -201,13 +218,12 @@ export function deriveManipulationAssessment(
   const indicators: ManipulationIndicator[] = [];
 
   // --- Declared mutations -------------------------------------------------
-  mutations.forEach((m) => {
-    const category = classifyMutation(m);
+  mutations.forEach((m, i) => {
     indicators.push({
       label: m,
-      category,
+      category: categories[i],
       detail: detailFor(m),
-      origin: 'Transformation analysis',
+      origin: mutationOrigin,
     });
   });
 
@@ -286,10 +302,8 @@ export function deriveManipulationAssessment(
   // metadata, an incomplete source) are recorded and they modulate strength,
   // but on their own they describe redistribution or missing context — not a
   // demonstrated editing operation — so they never flip the classification.
-  const mutationAiCount = mutations.filter((m) => classifyMutation(m) === 'ai').length;
-  const mutationConvCount = mutations.filter(
-    (m) => classifyMutation(m) === 'conventional'
-  ).length;
+  const mutationAiCount = categories.filter((c) => c === 'ai').length;
+  const mutationConvCount = categories.filter((c) => c === 'conventional').length;
   const classifiedMutations = mutationAiCount + mutationConvCount;
 
   const aiRatio = classifiedMutations > 0 ? mutationAiCount / classifiedMutations : 0;
@@ -435,6 +449,26 @@ export function deriveManipulationAssessment(
       'No synthetic-probability measurement is available for this media, so AI involvement is assessed from reported transformations alone.'
     );
   }
+  /* Naming the detector matters as much as the number. A reader has to be
+   * able to tell a measured score from a language model's estimate, and the
+   * two are indistinguishable once rendered as a percentage. */
+  const provenance = analysis?.detectorProvenance;
+  const syntheticDetector = provenance?.find((d) => d.role === 'synthetic');
+  if (syntheticDetector && !isAssessed(syntheticDetector.score)) {
+    limitations.push(
+      `The synthetic-image detector (${syntheticDetector.id}) returned no score for this media; AI involvement can neither be confirmed nor excluded.`
+    );
+  }
+  if (provenance?.some((d) => d.backend === 'language-model')) {
+    limitations.push(
+      'These figures are a language-model estimate rather than a detector measurement, and are not a forensic measurement of this file.'
+    );
+  }
+  if (!isAssessed(analysis?.structural?.compressionGenerations ?? NOT_ASSESSED)) {
+    limitations.push(
+      'No compression history was recovered, so redistribution depth is unknown.'
+    );
+  }
   const originEcho = caseState?.investigation?.originEcho;
   if (originEcho !== undefined && isAssessed(originEcho) && originEcho.is_estimated) {
     limitations.push(
@@ -457,6 +491,7 @@ export function deriveManipulationAssessment(
     sourceCompletenessWarning,
     assessmentLabel: PROTOTYPE_ASSESSMENT_LABEL,
     generatedAt: caseState?.ingest?.uploadTimestamp ?? '',
+    detectorProvenance: provenance,
   };
 }
 
@@ -499,6 +534,10 @@ function buildUnassessedAssessment(caseState: PersistentCaseState): Manipulation
       : undefined,
     assessmentLabel: PROTOTYPE_ASSESSMENT_LABEL,
     generatedAt: caseState?.ingest?.uploadTimestamp ?? '',
+    /* Carried even here. Which detector was asked and came back empty is
+     * itself a finding, and it is the difference between "not attempted"
+     * and "attempted and inconclusive". */
+    detectorProvenance: caseState?.analysis?.detectorProvenance,
   };
 }
 
